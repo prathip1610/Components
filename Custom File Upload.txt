@@ -1,0 +1,424 @@
+<template>
+    <div class="upload-container">
+        <lightning-card>
+            <div class="slds-grid slds-grid_align-spread slds-p-around_small slds-p-bottom_none">
+                <div class="slds-grid slds-grid_vertical-align-center">
+                    <lightning-icon icon-name="standard:file" alternative-text="File" title="File" size="medium"></lightning-icon>
+                    <h2 class="slds-text-heading_medium slds-m-left_small">Upload Files</h2>
+                </div>
+            </div>
+
+            <div class="slds-p-horizontal_medium slds-p-bottom_small">
+                <!-- File input -->
+                <lightning-input
+                    type="file"
+                    label="Upload File"
+                    multiple
+                    onchange={handleFileChange}>
+                </lightning-input>
+
+                <!-- Pills (file names) -->
+                <template if:true={filePills}>
+                    <div class="slds-m-top_small slds-m-bottom_small">
+                        <template for:each={filePills} for:item="pill">
+                            <span key={pill.label} class="slds-pill slds-m-right_x-small">
+                                <span class="slds-pill__label">{pill.label}</span>
+                                <lightning-icon
+                                    class="slds-pill__remove"
+                                    icon-name="utility:close"
+                                    size="x-small"
+                                    alternative-text="Remove"
+                                    onclick={handlePillRemove}
+                                    data-item={pill.label}>
+                                </lightning-icon>
+                            </span>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- Upload/Cancel buttons shown only when files are selected -->
+                <template if:true={filePills.length}>
+                    <div class="slds-m-top_small">
+                        <lightning-button
+                            label="Upload"
+                            onclick={handleUpload}
+                            variant="brand"
+                            class="slds-m-right_small">
+                        </lightning-button>
+                        <lightning-button
+                            label="Cancel"
+                            onclick={handleCancelUpload}
+                            variant="neutral">
+                        </lightning-button>
+                    </div>
+                </template>
+
+                <!-- Spinner -->
+                <template if:true={isLoading}>
+                    <div class="slds-m-top_small">
+                        <lightning-spinner
+                            alternative-text="Uploading..."
+                            size="medium"
+                            variant="brand">
+                        </lightning-spinner>
+                    </div>
+                </template>
+
+                <!-- File Table -->
+                <template if:true={files.length}>
+                    <lightning-datatable
+                        key-field="Id"
+                        data={paginatedFiles}
+                        columns={columns}
+                        onsort={onHandleSort}
+                        sorted-by={sortedBy}
+                        sorted-direction={sortDirection}
+                        default-sort-direction={defaultSortDirection}
+                        hide-checkbox-column
+                        onrowaction={handleRowAction}
+                        class="slds-m-top_medium">
+                    </lightning-datatable>
+
+                    <!-- Pagination -->
+                    <div class="slds-m-top_small slds-text-align_center">
+                        <lightning-button-icon
+                            icon-name="utility:left"
+                            disabled={isPreviousDisabled}
+                            alternative-text="Previous"
+                            title="Previous"
+                            onclick={handlePagination}
+                            data-direction="previous">
+                        </lightning-button-icon>
+                        <span class="slds-m-horizontal_small">{currentPage} of {totalPages}</span>
+                        <lightning-button-icon
+                            icon-name="utility:right"
+                            disabled={isNextDisabled}
+                            alternative-text="Next"
+                            title="Next"
+                            onclick={handlePagination}
+                            data-direction="next">
+                        </lightning-button-icon>
+                    </div>
+                </template>
+            </div>
+        </lightning-card>
+    </div>
+</template>
+
+---------------------------------------------------------------------------------------------------------
+import { LightningElement, api, track, wire } from 'lwc';
+import getFilesForRecord from '@salesforce/apex/FileUploadController.getFilesForRecord';
+import uploadFileToRecord from '@salesforce/apex/FileUploadController.uploadFileToRecord';
+import deleteContentDocument from '@salesforce/apex/FileUploadController.deleteContentDocument';
+import { refreshApex } from '@salesforce/apex';
+import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+import { NavigationMixin } from 'lightning/navigation';
+
+const columns = [
+    { label: 'File Name', fieldName: 'Title', type: 'text', sortable: true },
+    { label: 'File Type', fieldName: 'FileType', type: 'text' },
+    { label: 'File Size (KB)', fieldName: 'ContentSize', type: 'number', cellAttributes: { alignment: 'left' }, sortable: true },
+    {
+        type: 'button-icon',
+        initialWidth: 75,
+        label: 'Preview',
+        typeAttributes: {
+            iconName: 'utility:preview',
+            name: 'preview',
+            title: 'Preview',
+            variant: 'bare',
+            alternativeText: 'Preview'
+        }
+    },
+    {
+        type: 'button-icon',
+        initialWidth: 75,
+        label: 'Delete',
+        typeAttributes: {
+            iconName: 'utility:delete',
+            name: 'delete',
+            title: 'Delete',
+            variant: 'bare',
+            alternativeText: 'Delete'
+        }
+    }
+];
+
+export default class CustomFileUpload extends NavigationMixin(LightningElement) {
+    @api recordId;
+    @track files = [];
+    @track fileData = {};
+    @track isLoading = false;
+    @track paginatedFiles = [];
+    @track currentPage = 1;
+    @track totalPages = 0;
+    @track isPreviousDisabled = true;
+    @track isNextDisabled = true;
+    @track filePills = [];
+    @track sortedBy;
+    @track defaultSortDirection = 'asc';
+    @track sortDirection = 'asc';
+    wiredFilesResult;
+    showSuccessMessage = false;
+
+    columns = columns;
+
+    @wire(getFilesForRecord, { recordId: '$recordId' })
+    wiredFiles(result) {
+        this.wiredFilesResult = result;
+        const { error, data } = result;
+        if (data) {
+            this.files = data.map(file => ({
+                ...file.ContentDocument,
+                FileType: file.ContentDocument.FileType,
+                ContentSize: (file.ContentDocument.ContentSize / 1024).toFixed(2)
+            }));
+            this.sortData(this.sortedBy, this.sortDirection);
+            this.paginateFiles();
+        } else if (error) {
+            console.error('Error fetching files:', error);
+        }
+    }
+
+    handleFileChange(event) {
+        const files = event.target.files;
+        if (files.length > 0) {
+            Array.from(files).forEach(file => {
+                const fileExtension = file.name.split('.').pop().toLowerCase();
+                if (fileExtension === 'csv') {
+                    this.dispatchEvent(
+                        new ShowToastEvent({
+                            title: 'Unsupported Format',
+                            message: 'CSV files are not allowed.',
+                            variant: 'error'
+                        })
+                    );
+                    return;
+                }
+
+                const fileData = {
+                    base64: '',
+                    fileName: file.name,
+                    contentType: file.type
+                };
+
+                const reader = new FileReader();
+                reader.onload = () => {
+                    fileData.base64 = reader.result.split(',')[1];
+                    this.filePills.push({ label: fileData.fileName, file: fileData });
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+    }
+
+
+    handleUpload() {
+        if (!this.filePills.length) {
+            this.dispatchEvent(
+                new ShowToastEvent({
+                    title: 'Warning!',
+                    message: 'Please select file to upload.',
+                    variant: 'warning'
+                })
+            );
+            return;
+        }
+
+        this.isLoading = true; // Show spinner
+
+        const uploadPromises = this.filePills.map(pill =>
+            uploadFileToRecord({
+                recordId: this.recordId,
+                fileName: pill.file.fileName,
+                base64Data: pill.file.base64,
+                contentType: pill.file.contentType
+            })
+        );
+
+        Promise.all(uploadPromises)
+            .then(() => {
+                return refreshApex(this.wiredFilesResult);
+            })
+            .then(() => {
+                this.showSuccessMessage = true; // Show success message
+                setTimeout(() => {
+                    this.showSuccessMessage = false; // Hide success message after a delay
+                }, 3000); // Adjust the timeout as per your preference
+                this.dispatchEvent(
+                    new ShowToastEvent({
+                        title: 'Success!',
+                        message: 'Files Uploaded Successfully!',
+                        variant: 'success'
+                    })
+                );
+                this.isLoading = false; // Hide spinner after success
+                this.fileData = {};
+                this.filePills = [];
+            })
+            .catch(error => {
+                console.error('Error uploading files:', error);
+                this.dispatchEvent(
+                    new ShowToastEvent({
+                        title: 'Error!',
+                        message: 'Error uploading files. Please try again.',
+                        variant: 'error'
+                    })
+                );
+                this.isLoading = false; // Hide spinner on error
+            });
+    }
+
+    handlePillRemove(event) {
+        const itemToRemove = event.target.dataset.item;
+        this.filePills = this.filePills.filter(pill => pill.label !== itemToRemove);
+        if (this.fileData.fileName === itemToRemove) {
+            this.fileData = {};
+        }
+    }
+
+    handleCancelUpload() {
+        this.fileData = {};
+        this.filePills = [];
+    }
+
+    handleRowAction(event) {
+        const actionName = event.detail.action.name;
+        const row = event.detail.row;
+        switch (actionName) {
+            case 'preview':
+                this.previewFile(row.Id);
+                break;
+            case 'delete':
+                this.deleteFile(row.Id);
+                break;
+            default:
+        }
+    }
+
+    previewFile(contentDocumentId) {
+        this[NavigationMixin.Navigate]({
+            type: 'standard__namedPage',
+            attributes: {
+                pageName: 'filePreview'
+            },
+            state: {
+                selectedRecordId: contentDocumentId
+            }
+        });
+    }
+
+    deleteFile(contentDocumentId) {
+        deleteContentDocument({ recordId: contentDocumentId })
+            .then(() => {
+                return refreshApex(this.wiredFilesResult);
+            })
+            .then(() => {
+                this.dispatchEvent(
+                    new ShowToastEvent({
+                        title: 'Success!',
+                        message: 'File Deleted Successfully!',
+                        variant: 'success'
+                    })
+                );
+            })
+            .catch(error => {
+                console.error('Error deleting file:', error);
+                this.dispatchEvent(
+                    new ShowToastEvent({
+                        title: 'Error!',
+                        message: 'Error deleting file. Please try again.',
+                        variant: 'error'
+                    })
+                );
+            });
+    }
+
+    paginateFiles() {
+        const pageSize = 5;
+        const startIndex = (this.currentPage - 1) * pageSize;
+        const endIndex = this.currentPage * pageSize;
+        this.paginatedFiles = this.files.slice(startIndex, endIndex);
+        this.totalPages = Math.ceil(this.files.length / pageSize);
+        this.isPreviousDisabled = this.currentPage === 1;
+        this.isNextDisabled = this.currentPage === this.totalPages;
+    }
+
+    handlePagination(event) {
+        const direction = event.target.dataset.direction;
+        if (direction === 'previous' && this.currentPage > 1) {
+            this.currentPage -= 1;
+        } else if (direction === 'next' && this.currentPage < this.totalPages) {
+            this.currentPage += 1;
+        }
+        this.paginateFiles();
+    }
+
+    onHandleSort(event) {
+        this.sortedBy = event.detail.fieldName;
+        this.sortDirection = event.detail.sortDirection;
+        this.sortData(this.sortedBy, this.sortDirection);
+    }
+
+    sortData(fieldname, direction) {
+        // Parse data based on sort direction and field name
+        let parseData = JSON.parse(JSON.stringify(this.files));
+        // Return new data based on the direction and field name
+        let keyValue = (a) => {
+            return a[fieldname];
+        }
+        let isReverse = direction === 'asc' ? 1 : -1;
+        parseData.sort((x, y) => {
+            x = keyValue(x) ? keyValue(x) : ''; // handling null values
+            y = keyValue(y) ? keyValue(y) : ''; // handling null values
+            return isReverse * ((x > y) - (y > x));
+        });
+
+        // Assign the sorted data to files
+        this.files = parseData;
+        this.paginateFiles();
+    }
+}
+-----------------------------------------------------------------------------------------------
+.upload-container {
+    padding: 0.5rem;
+}
+----------------------------------------------------------------------------------------------
+public class FileUploadController {
+
+
+    @AuraEnabled(cacheable=true)
+    public static List<ContentDocumentLink> getFilesForRecord(Id recordId) {
+        try {
+            return [
+                SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileType, ContentDocument.ContentSize
+                FROM ContentDocumentLink
+                WHERE LinkedEntityId = :recordId
+                ORDER BY ContentDocument.CreatedDate DESC
+            ];
+        } catch (Exception e) {
+            throw new AuraHandledException(e.getMessage());
+        }
+    }
+
+    @AuraEnabled
+    public static void uploadFileToRecord(Id recordId, String fileName, String base64Data, String contentType) {
+        Blob fileBlob = EncodingUtil.base64Decode(base64Data);
+        ContentVersion cv = new ContentVersion();
+        cv.VersionData = fileBlob;
+        cv.Title = fileName;
+        cv.PathOnClient = '/' + fileName;
+        cv.FirstPublishLocationId = recordId;
+        insert cv;
+    }
+
+    @AuraEnabled
+    public static void deleteContentDocument(String recordId) {
+        List<ContentDocument> cdList = [
+            SELECT Id 
+            FROM ContentDocument 
+            WHERE Id = :recordId
+        ];
+        delete cdList;
+    }
+}
