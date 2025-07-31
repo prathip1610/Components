@@ -1,0 +1,328 @@
+<template>
+    <lightning-card class="custom-card">
+        <div class="container">
+
+            <!-- Heading -->
+            <h1 class="header">Generate Account Summary PDF</h1>
+
+            <!-- Button -->
+            <div class="button-section">
+                <lightning-button
+                    variant="brand"
+                    label="Generate PDF"
+                    onclick={handleGeneratePDF}>
+                </lightning-button>
+            </div>
+
+            <!-- Spinner -->
+            <template if:true={isLoading}>
+                <div class="spinner-overlay">
+                    <lightning-spinner alternative-text="Loading" size="large"></lightning-spinner>
+                    <p class="loading-text">Generating your PDF, please wait...</p>
+                </div>
+            </template>
+
+            <!-- Public Link -->
+            <template if:true={publicUrl}>
+                <div class="link-section">
+                    <p><strong>Public Link:</strong></p>
+                    <a href={publicUrl} target="_blank" class="link-wrap">{publicUrl}</a>
+                </div>
+            </template>
+
+        </div>
+    </lightning-card>
+</template>
+-------------------------------------------------------------------------------------------------------
+
+import { LightningElement, api, track, wire } from 'lwc';
+import { getRecord } from 'lightning/uiRecordApi';
+import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+import { NavigationMixin } from 'lightning/navigation';
+import generateAndAttachPDF from '@salesforce/apex/GeneratePDFDocumentController.generateAndAttachPDF';
+
+import ACCOUNT_SUMMARY_PDF_URL from '@salesforce/schema/Account.Account_Summary_PDF_Url__c';
+const FIELDS = [ACCOUNT_SUMMARY_PDF_URL];
+
+export default class GeneratePaymentDocument extends NavigationMixin(LightningElement) {
+    @api recordId;
+    @track isLoading = false;
+    @track publicUrl;
+
+    @wire(getRecord, { recordId: '$recordId', fields: FIELDS })
+    wiredAccount({ error, data }) {
+        if (data) {
+            this.publicUrl = data.fields.Account_Summary_PDF_Url__c.value;
+        } else if (error) {
+            console.error('Error fetching account URL:', error);
+        }
+    }
+
+    handleGeneratePDF() {
+        this.isLoading = true;
+
+        generateAndAttachPDF({ accountId: this.recordId })
+            .then((result) => {
+                this.isLoading = false;
+
+                if (result) {
+                    this.publicUrl = result;
+                    this.showToast('Success', 'PDF generated and link created.', 'success');
+
+                    // Delay for any backend update, then refresh record view
+                    setTimeout(() => {
+                        this.refreshRecordData();
+                    }, 1000);
+                } else {
+                    this.showToast('Info', 'PDF generated but no public link returned.', 'info');
+                }
+            })
+            .catch((error) => {
+                this.isLoading = false;
+
+                let errorMessage = 'Unknown error occurred';
+                if (error && error.body && error.body.message) {
+                    errorMessage = error.body.message;
+                } else if (error && error.message) {
+                    errorMessage = error.message;
+                }
+
+                console.error('PDF generation error:', error);
+                this.showToast('Error', errorMessage, 'error');
+            });
+    }
+
+    refreshRecordData() {
+        this[NavigationMixin.Navigate]({
+            type: 'standard__recordPage',
+            attributes: {
+                recordId: this.recordId,
+                objectApiName: 'Account',
+                actionName: 'view'
+            }
+        }, true); // true = replace history entry
+    }
+
+    showToast(title, message, variant) {
+        this.dispatchEvent(new ShowToastEvent({ title, message, variant }));
+    }
+}
+------------------------------------------------------------------------------------------------
+public with sharing class GeneratePDFDocumentController {
+    
+    @AuraEnabled
+    public static String generateAndAttachPDF(Id accountId) {
+        try {
+            // Query the required fields from the Account object
+            Account account = [
+                SELECT Id, Name, Account_Summary_PDF_Url__c 
+                FROM Account 
+                WHERE Id = :accountId
+            ];
+
+            // Prepare the Visualforce PageReference
+            PageReference pdfPage = Page.PdfAccountPage;
+            if (pdfPage == null) {
+                throw new AuraHandledException('Visualforce page PdfAccountPage not found.');
+            }
+
+            // Add Account Id as parameter
+            pdfPage.getParameters().put('id', accountId);
+
+            // Generate PDF Blob
+            Blob pdfBlob = pdfPage.getContentAsPDF();
+
+            // Generate dynamic file name
+            String fileName = 'Account Summary - ' + account.Name + '.pdf';
+
+            // Check for existing ContentVersion with same file name
+            List<ContentVersion> existingContentVersions = [
+                SELECT Id, Title FROM ContentVersion 
+                WHERE Title = :fileName AND FirstPublishLocationId = :accountId
+                ORDER BY CreatedDate DESC
+            ];
+
+            String publicUrl;
+
+            if (!existingContentVersions.isEmpty()) {
+                // Use existing ContentVersion
+                ContentVersion existingVersion = existingContentVersions[0];
+                List<ContentDistribution> distributions = generatePublicLink(existingVersion);
+                if (!distributions.isEmpty()) {
+                    publicUrl = distributions[0].DistributionPublicUrl;
+                    account.Account_Summary_PDF_Url__c = publicUrl;
+                    update account;
+                }
+                return publicUrl;
+            }
+
+            // Create new ContentVersion
+            ContentVersion newVersion = new ContentVersion();
+            newVersion.VersionData = pdfBlob;
+            newVersion.Title = fileName;
+            newVersion.PathOnClient = fileName;
+            newVersion.FirstPublishLocationId = accountId;
+            insert newVersion;
+
+            // Generate public link
+            List<ContentDistribution> newDistributions = generatePublicLink(newVersion);
+            if (!newDistributions.isEmpty()) {
+                publicUrl = newDistributions[0].DistributionPublicUrl;
+                account.Account_Summary_PDF_Url__c = publicUrl;
+                update account;
+            }
+
+            return publicUrl;
+
+        } catch (Exception e) {
+            System.debug('Error generating and attaching PDF: ' + e.getMessage());
+            throw new AuraHandledException('Error generating and attaching PDF: ' + e.getMessage());
+        }
+    }
+
+    // Generate public link for a given ContentVersion
+    private static List<ContentDistribution> generatePublicLink(ContentVersion contentVersion) {
+        List<ContentDistribution> results = new List<ContentDistribution>();
+
+        if (contentVersion != null && String.isNotBlank(contentVersion.Title)) {
+            ContentDistribution distribution = new ContentDistribution();
+            distribution.ContentVersionId = contentVersion.Id;
+            distribution.Name = contentVersion.Title;
+            distribution.PreferencesAllowOriginalDownload = true;
+            insert distribution;
+
+            // Query the public URL
+            distribution = [
+                SELECT DistributionPublicUrl 
+                FROM ContentDistribution 
+                WHERE Id = :distribution.Id 
+                LIMIT 1
+            ];
+
+            results.add(distribution);
+        }
+
+        return results;
+    }
+}
+--------------------------------------------------------------------------------------------
+.card-header h1 {
+    font-family: 'Roboto', sans-serif; /* Apply Google Font */
+    font-size: 15px; /* Adjust font size */
+    font-weight: 700; /* Bold font weight */
+    color:rgb(148, 148, 157); /* Dark gray color */
+}
+
+
+
+.spinner-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(255, 255, 255, 0.8); /* Semi-transparent background */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000; /* Ensure spinner is on top */
+}
+
+.loading-text {
+    margin-top: 10px;
+    font-size: 18px; /* Larger font size */
+    font-weight: 500; /* Medium font weight */
+    color: #333; /* Dark gray color */
+}
+
+.container {
+    padding: 1.5rem;
+    background: white;
+    border-radius: 1rem;
+}
+
+.header {
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: #4b4b4b;
+    margin-bottom: 1rem;
+}
+
+.button-section {
+    margin-bottom: 1.5rem;
+}
+
+.spinner-overlay {
+    text-align: center;
+    margin-top: 1rem;
+}
+
+.loading-text {
+    font-style: italic;
+    color: #777;
+    margin-top: 0.5rem;
+}
+
+.link-section {
+    margin-top: 1rem;
+    word-break: break-all;
+    overflow-wrap: break-word;
+}
+
+.link-wrap {
+    display: inline-block;
+    color: #0070d2;
+    margin-top: 0.25rem;
+    font-size: 0.95rem;
+}
+------------------------------------------------------------------------------------------------------------
+
+VF - Page 
+
+<apex:page contentType="application/pdf" standardController="Account" applyBodyTag="false">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            color: #333;
+            margin: 20px;
+        }
+        h1 {
+            color: #0056b3;
+            border-bottom: 2px solid #0056b3;
+            padding-bottom: 10px;
+        }
+        p {
+            margin: 10px 0;
+            line-height: 1.6;
+        }
+        .section-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #0056b3;
+            margin-top: 20px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 5px;
+        }
+        .highlight {
+            background-color: #f9f9f9;
+            padding: 10px;
+            border-left: 4px solid #0056b3;
+        }
+    </style>
+
+    <h1>Account Summary</h1>
+
+    <p class="section-title">Account Information</p>
+    <p><strong>Account Name:</strong> {!Account.Name}</p>
+    <p><strong>Account Number:</strong> {!Account.AccountNumber}</p>
+    <p><strong>Phone:</strong> {!Account.Phone}</p>
+    <p><strong>Website:</strong> {!Account.Website}</p>
+    <p><strong>Industry:</strong> {!Account.Industry}</p>
+    <p><strong>Annual Revenue:</strong> {!Account.AnnualRevenue}</p>
+
+    <p class="section-title">Business Overview</p>
+    <p class="highlight">The {!Account.Name} account has been a valued partner in the {Account.Industry} industry. We look forward to continuing our successful relationship and supporting their growth with tailored services and solutions.</p>
+
+    <p class="section-title">Contact Details</p>
+    <p>For more information about this account or to discuss future opportunities, please contact the account manager directly at {!Account.Phone} or visit their website at <a href="http://{!Account.Website}" target="_blank">{!Account.Website}</a>.</p>
+</apex:page>
