@@ -1,0 +1,494 @@
+<!--
+   * @name         : emailFailedPayment.Html
+   * @description  : Sends email notifications for failed payments and includes a search bar, action button, and data table.
+   * @author       : DotSolved
+   * @date         : 2024-07-24
+-->
+
+<template>
+	<!-- 
+       * Container for the entire component with border styling 
+    -->
+	<div class="container">
+		<lightning-card>
+			<div class="slds-grid slds-grid_align-spread slds-p-horizontal_small slds-p-vertical_small">
+
+				<!-- 
+                   * Title of the card 
+                -->
+				<div class="slds-col slds-text-heading_medium">
+					Send Email Notification for Contacts.
+				</div>
+
+				<!-- 
+                   * Search input and Send Email button 
+                -->
+				<div class="slds-col slds-shrink-none">
+					<div class="slds-grid slds-grid_align-end">
+						<lightning-input type="search" placeholder="Search this list..." onchange={handleSearch}
+							class="slds-m-right_small">
+						</lightning-input>
+						<lightning-button class="send-email-button" label="Send Email" onclick={handleSendEmail}
+							variant="brand">
+						</lightning-button>
+					</div>
+				</div>
+			</div>
+
+			<!-- 
+               * Data Table section with scrollable content 
+            -->
+			<div class="datatable-container">
+				<!-- 
+                   * Lightning Datatable for displaying filtered data 
+                -->
+				<lightning-datatable key-field="Id" data={filteredData} columns={columns} sorted-by={sortBy}
+					sorted-direction={sortDirection} onsort={handleSort} show-checkbox-column show-row-number-column
+					onrowselection={handleRowSelection}>
+				</lightning-datatable>
+			</div>
+
+			<!-- 
+               * Spinner to show loading state 
+            -->
+			<template if:true={showSpinner}>
+				<lightning-spinner alternative-text="Loading" size="medium" variant="brand">
+				</lightning-spinner>
+			</template>
+		</lightning-card>
+	</div>
+</template>
+
+*****************************************************************************
+/**
+ * @name         : emailFailedPayment.JS
+ * @description  : LWC component to send email notifications for failed payments.
+ * @date         : 2024-07-24
+ */
+
+/**
+ * Import core LWC classes for component creation and data handling
+ */
+import { LightningElement, wire, track } from 'lwc';
+
+/**
+ * Import Apex methods for fetching contact data and sending emails.
+ */
+import getContactDataWithConfig from '@salesforce/apex/SendEmailController.getContactDataWithConfig';
+import sendEmail from '@salesforce/apex/SendEmailController.sendEmail';
+
+/**
+ * Import the Lightning component's toast event utility for showing notifications.
+ */
+/**
+ * Import the Lightning component's toast event utility for showing notifications.
+ */
+import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+
+/**
+ * Import the refreshApex function to refresh data after an action, such as sending emails.
+ */
+import { refreshApex } from '@salesforce/apex';
+/**
+ * Import the refreshApex function to refresh data after an action, such as sending emails.
+ */
+
+/**
+ * Import custom labels for Maximum row selections.
+ */
+
+export default class EmailFailedPayment extends LightningElement {
+    @track data;                     // Holds the data for the data table
+    @track filteredData;             // Holds the filtered data for the data table
+    @track columns = [];             // Columns for the data table
+    @track error;                    // Holds error information
+    @track sortBy;                   // Field to sort by
+    @track sortDirection;            // Direction to sort
+    @track searchTerm = '';          // Search term for filtering data
+    @track selectedRows = new Set(); // Set of selected rows
+    @track showSpinner = false;      // Spinner visibility control
+    @track wiredDataResult;          // Holds the result of the wired data
+        MAX_SELECTION = 10; // Maximum number of rows that can be selected
+
+
+    /**
+     * Wire method to fetch contact data and columns configuration from Apex.
+     */
+     @wire(getContactDataWithConfig)
+    wiredContacts(result) {
+        this.wiredDataResult = result; // Save the wired result to use with refreshApex
+        const { data, error } = result;
+        if (data) {
+            const { contacts, columns } = data;
+
+            this.data = contacts.map(record => {
+                const accountName = record.Account?.Name;
+                const accountLink = record.AccountId ? `/lightning/r/Account/${record.AccountId}/view` : '';
+                const contactLink = `/lightning/r/Contact/${record.Id}/view`;
+
+                // Format the Email Sent Date with the desired format
+                const emailSentDate = record.Last_Email_Sent_Date__c // Make sure this field name matches your Apex response
+                    ? new Date(record.Last_Email_Sent_Date__c).toLocaleDateString('en-US', {
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric'
+                    })
+                    : '';
+
+                return {
+                    ...record,
+                    AccountName: accountName,
+                    accountLink,
+                    contactLink,
+                    EmailSentDateText: emailSentDate, 
+                };
+            });
+
+            this.columns = Object.keys(columns).map(fieldName => {
+                if (fieldName === 'Name') {
+                    return {
+                        label: columns[fieldName],
+                        fieldName: 'contactLink',
+                        type: 'url',
+                        typeAttributes: {
+                            label: {
+                                fieldName: 'Name'
+                            },
+                            target: '_self'
+                        },
+                        sortable: true
+                    };
+                } else if (fieldName === 'Account.Name') {
+                    return {
+                        label: columns[fieldName],
+                        fieldName: 'accountLink',
+                        type: 'url',
+                        typeAttributes: {
+                            label: {
+                                fieldName: 'AccountName'
+                            },
+                            target: '_self'
+                        },
+                        sortable: true
+                    };
+                } else if (fieldName === 'Last_Email_Sent_Date__c') {
+                    return {
+                        label: columns[fieldName],
+                        fieldName: 'EmailSentDateText',
+                        type: 'text', 
+                        sortable: true
+                    };
+                } else {
+                    return {
+                        label: columns[fieldName],
+                        fieldName: fieldName,
+                        type: fieldName.includes('Date') ? 'date' : 'text', 
+                        sortable: true
+                    };
+                }
+            });
+
+            this.updateFilteredData();
+        } else if (error) {
+            this.error = error;
+        }
+    }
+
+     /**
+     * Handles sorting of data table columns.
+     */
+    handleSort(event) {
+        const { fieldName: sortedBy, sortDirection } = event.detail;
+        this.sortBy = sortedBy;
+        this.sortDirection = sortDirection;
+        this.sortData(sortedBy, sortDirection);
+    }
+
+    /**
+     * Sorts data based on the specified field and direction.
+     */
+    sortData(field, direction) {
+        let cloneData = [...this.data];
+        cloneData.sort((a, b) => {
+            let valueA = a[field];
+            let valueB = b[field];
+
+            if (valueA === undefined || valueA === null) valueA = '';
+            if (valueB === undefined || valueB === null) valueB = '';
+
+            if (typeof valueA === 'number' && typeof valueB === 'number') {
+                return direction === 'asc' ? valueA - valueB : valueB - valueA;
+            }
+
+            if (typeof valueA === 'boolean' && typeof valueB === 'boolean') {
+                return direction === 'asc' ? (valueA === valueB ? 0 : valueA ? -1 : 1) : (valueA === valueB ? 0 : valueA ? 1 : -1);
+            }
+            return direction === 'asc'
+                ? (valueA + '').localeCompare(valueB + '')
+                : (valueB + '').localeCompare(valueA + '');
+        });
+        this.data = cloneData;
+        this.updateFilteredData();
+    }
+
+    /**
+     * Updates the filtered data based on the search term.
+     */
+    updateFilteredData() {
+        let filteredData = [...this.data];
+        if (this.searchTerm) {
+            filteredData = filteredData.filter(row =>
+                Object.values(row).some(
+                    value => value && value.toString().toLowerCase().includes(this.searchTerm.toLowerCase())
+                )
+            );
+        }
+        this.filteredData = filteredData.map(row => ({
+            ...row,
+            isSelected: this.selectedRows.has(row.Id)
+        }));
+    }
+
+    /**
+     * Handles search input change and updates filtered data.
+     */
+    handleSearch(event) {
+        this.searchTerm = event.target.value;
+        this.updateFilteredData();
+    }
+
+    /**
+     * Handles row selection in the data table.
+     */
+    handleRowSelection(event) {
+        const selectedRows = event.detail.selectedRows.map(row => row.Id);
+
+        if (selectedRows.length > this.MAX_SELECTION) {
+            this.showToast('Warning', `You can select up to ${this.MAX_SELECTION} records only.`, 'warning');
+            const selectionToKeep = [...this.selectedRows];
+            this.template.querySelector('lightning-datatable').selectedRows = selectionToKeep;
+            return;
+        }
+        this.selectedRows = new Set(selectedRows);
+    }
+
+    /**
+     * Handles the Send Email button click event.
+     */
+    handleSendEmail() {
+        if (this.selectedRows.size === 0) {
+            this.showToast('Info', 'No invoices selected. Please select at least one invoice to send an email.', 'info');
+            return;
+        }
+        this.showSpinner = true;
+
+        sendEmail({ contactIds: Array.from(this.selectedRows) })
+            .then(() => {
+                this.showToast('Success', 'Emails sent successfully.', 'success');
+                return refreshApex(this.wiredDataResult);
+            })
+            .then(() => {
+                this.selectedRows = new Set();
+                this.template.querySelector('lightning-datatable').selectedRows = [];
+                this.showSpinner = false;
+            })
+            .catch(error => {
+                this.showToast('Error', 'Failed to send emails: ' + error.body.message, 'error');
+                this.showSpinner = false;
+            });
+    }
+
+    /**
+     * Displays a toast message.
+     */
+    showToast(title, message, variant) {
+        const event = new ShowToastEvent({
+            title,
+            message,
+            variant,
+        });
+        this.dispatchEvent(event);
+    }
+}
+**************************************************************************************************
+.container {
+    border: 1px solid #606060;
+    border-radius: 0.25rem;
+}
+
+/**
+ * Data Table section with scrollable content.
+ */
+.datatable-container {
+    height: 315px;
+    overflow-y: auto;
+}
+
+/**
+ * Styling for the Send Email button.
+ */
+.send-email-button {
+    margin-top: 17px;
+}
+.datatable-container {
+    height: 300px; /* or any appropriate height */
+    overflow-y: auto;
+}
+*********************************************************************************************************
+public with sharing class SendEmailController {
+
+    @AuraEnabled(cacheable = true)
+    public static Map<String, Object> getContactDataWithConfig() {
+        // Query to retrieve custom metadata configurations
+        List<Send_Email_Notification__mdt> configList = [
+            SELECT
+                Id,
+                Field_Label_Name__c,
+                Field_Api_Name__c,
+                Display_Order__c,
+                DeveloperName
+            FROM
+                Send_Email_Notification__mdt
+            ORDER BY
+                Display_Order__c ASC
+        ];
+
+        // Construct dynamic field names and labels
+        List<String> fieldNames = new List<String>();
+        Map<String, String> fieldLabelMap = new Map<String, String>();
+
+        for (Send_Email_Notification__mdt config : configList) {
+            fieldNames.add(config.Field_Api_Name__c);
+            fieldLabelMap.put(config.Field_Api_Name__c, config.Field_Label_Name__c);
+        }
+
+        // Prepare the query based on dynamic field names from custom metadata
+        String query = 'SELECT ' + String.join(fieldNames, ', ') + ' FROM Contact WHERE Email != \'\'';
+        List<Contact> contactList = Database.query(query);
+
+        // Return both data and configuration
+        return new Map<String, Object> {
+            'contacts' => contactList,
+            'columns' => fieldLabelMap
+        };
+    }
+
+    @AuraEnabled
+    public static void sendEmail(List<Id> contactIds) {
+        // Check if contactIds is null or empty
+        if (contactIds == null || contactIds.isEmpty()) {
+            return;
+        }
+
+        // Query to fetch contacts with valid email addresses based on provided contact IDs
+        List<Contact> contacts = [
+            SELECT
+                Id,
+                FirstName,
+                LastName,
+                Email,
+                Account.Name,
+                Last_Email_Sent_Date__c // Ensure this field is selected for update
+            FROM
+                Contact
+            WHERE
+                Id IN :contactIds AND Email != null
+        ];
+
+        // Check if the contacts list is empty
+        if (contacts.isEmpty()) {
+            return;
+        }
+
+        // Query to fetch the email template for contact notification
+        EmailTemplate et;
+        try {
+            et = [
+                SELECT
+                    Id,
+                    Subject,
+                    HtmlValue,
+                    Body
+                FROM
+                    EmailTemplate
+                WHERE
+                    DeveloperName = 'LWC_Contacts_Mail'
+                LIMIT 1
+            ];
+        } catch (Exception e) {
+            return;
+        }
+
+        // Check if the email template is null
+        if (et == null) {
+            return;
+        }
+
+        // Query to fetch the org-wide email address for sending emails
+        OrgWideEmailAddress owea;
+        try {
+            owea = [
+                SELECT
+                    Id
+                FROM
+                    OrgWideEmailAddress
+                WHERE
+                    Address = 'prathip1610@gmail.com'
+                LIMIT 1
+            ];
+        } catch (Exception e) {
+            return;
+        }
+
+        // Check if the org-wide email address is null
+        if (owea == null) {
+            return;
+        }
+
+        // Create a list to store email messages
+        List<Messaging.SingleEmailMessage> emails = new List<Messaging.SingleEmailMessage>();
+
+        // Iterate through each contact
+        for (Contact contact : contacts) {
+            String emailBody = et.HtmlValue;
+            String emailSubject = et.Subject;
+
+            // Replace merge fields in the email body and subject with actual values
+            String firstName = contact.FirstName != null ? contact.FirstName : '';
+            String lastName = contact.LastName != null ? contact.LastName : '';
+            String accountName = contact.Account.Name != null ? contact.Account.Name : '';
+
+            emailBody = emailBody.replace('{!Contact.FirstName}', firstName);
+            emailBody = emailBody.replace('{!Contact.LastName}', lastName);
+            emailSubject = emailSubject.replace('{!Account.Name}', accountName);
+
+            // Create a new email message
+            Messaging.SingleEmailMessage email = new Messaging.SingleEmailMessage();
+            email.setToAddresses(new String[] { contact.Email }); // Using the standard Email field of Contact
+            email.setHtmlBody(emailBody);
+            email.setSubject(emailSubject);
+            email.setOrgWideEmailAddressId(owea.Id);
+            email.setTargetObjectId(contact.Id); // Correctly sets the Contact as the target
+
+            // Ensure the contact is the recipient
+            email.setTreatTargetObjectAsRecipient(true);
+
+            emails.add(email);
+
+            // Update the Last_Email_Sent_Date__c field to the current date
+            contact.Last_Email_Sent_Date__c = Date.today();
+        }
+
+        // Send the emails if there are any to send
+        if (!emails.isEmpty()) {
+            Messaging.sendEmail(emails);
+        }
+
+        // Perform DML operation to update the contacts with the sent date
+        if (!contacts.isEmpty()) {
+            // Use Database.update to perform the update operation
+            Database.update(contacts, false);
+        }
+    }
+}
+**********************************************************************************************************
